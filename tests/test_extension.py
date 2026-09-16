@@ -1,5 +1,7 @@
 import json
 import re
+import sys
+import threading
 import time
 import types
 
@@ -51,6 +53,9 @@ class DummyApp:
 
     def add_extension(self, name: str) -> None:
         self.extensions[name] = Extension(name, types.ModuleType(name))
+
+    def connect(self, name, callback, priority=500):
+        return self.events.connect(name, callback, priority)
 
 
 @pytest.fixture
@@ -231,10 +236,13 @@ def test_write_json(log, tmp_path):
         "total_wall_time": 12.5,
     }
 
-    log.write_json(project_info, build_info, str(out))
+    frames = {"sampling_interval": 0.001, "samples": 0, "snapshots": []}
+
+    log.write_json(project_info, build_info, frames, str(out))
     data = json.loads(out.read_text())
 
-    assert set(data) == {"project_info", "build_info", "calls", "events"}
+    assert set(data) == {"project_info", "build_info", "calls", "events", "frames"}
+    assert data["frames"] == frames
     assert data["project_info"] == project_info
     assert data["build_info"] == build_info
     assert data["calls"][0]["handler"] == "handler"
@@ -297,3 +305,159 @@ def test_real_build_benchmarks(tmp_path, monkeypatch):
     }
     assert all(c["kind"] != "unknown" or c["extension"] for c in data["calls"])
     assert any(c["kind"] == "sphinx-internal" for c in data["calls"])
+    frames = data["frames"]
+    assert frames["sampling_interval"] == bs.DEFAULT_SAMPLING_INTERVAL
+    assert frames["samples"] == len(frames["snapshots"]) > 0
+    assert {f["kind"] for f in frames["functions"]} >= {"sphinx-internal", "stdlib"}
+    n_functions, n_stacks = len(frames["functions"]), len(frames["stacks"])
+    assert all(0 <= i < n_functions for stack in frames["stacks"] for i in stack)
+    times = [t for t, _ in frames["snapshots"]]
+    assert times == sorted(times)
+    assert 0 <= times[0] and times[-1] <= data["build_info"]["total_wall_time"]
+    assert all(0 <= stack < n_stacks for _, stack in frames["snapshots"])
+
+
+# stack snapshots of the build
+
+
+def busy_wait(seconds):
+    """Burn CPU (so the sampler sees this frame) for ``seconds``."""
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        pass
+
+
+def test_sampler_records_snapshots_with_time_and_stack():
+    sampler = bs.StackSampler(recorder, 0.001, threading.get_ident())
+    sampler.start()
+    try:
+        t0 = time.perf_counter() - recorder.start_time
+        busy_wait(SLEEP)
+        t1 = time.perf_counter() - recorder.start_time
+    finally:
+        sampler.stop()
+
+    times = [t for t, _ in sampler.snapshots]
+    assert times == sorted(times)
+    inside = [(t, s) for t, s in sampler.snapshots if t0 <= t <= t1]
+    # the sampler only gets the GIL every 5ms (16ms on Windows), more on a loaded
+    # machine, so only ask for a few samples
+    assert len(inside) >= 3
+    functions = {
+        sampler.functions[i]["function"] for _, s in inside for i in sampler.stacks[s]
+    }
+    assert {
+        "busy_wait",
+        "test_sampler_records_snapshots_with_time_and_stack",
+    } <= functions
+    # a sampled stack lists the innermost frame first
+    innermost = {sampler.functions[sampler.stacks[s][0]]["function"] for _, s in inside}
+    assert innermost == {"busy_wait"}
+
+
+def test_sampler_keeps_sampling_inside_emissions(app):
+    app.events.connect("builder-inited", lambda app_arg: busy_wait(SLEEP / 2))
+    wrap_emit(app)
+    wrap_all_listeners(app)
+    sampler = bs.StackSampler(recorder, 0.001, threading.get_ident())
+    sampler.start()
+    try:
+        app.events.emit("builder-inited")
+    finally:
+        sampler.stop()
+
+    (call,) = recorder.calls
+    during = [
+        sampler.stacks[s]
+        for t, s in sampler.snapshots
+        if call.start <= t <= call.start + call.duration
+    ]
+    assert len(during) >= 3  # see test_sampler_records_snapshots_with_time_and_stack
+    assert {sampler.functions[stack[0]]["function"] for stack in during} == {
+        "busy_wait"
+    }
+    # the wrapper the extension put around the handler is on those stacks, so
+    # the summary can cut them down to the part inside the handler
+    wrappers = {
+        sampler.functions[i]["function"]
+        for stack in during
+        for i in stack
+        if sampler.functions[i]["module"] == "sphinx_benchmark.extension"
+    }
+    assert wrappers >= {"wrap_listener.<locals>.wrapped", "wrap_emit.<locals>.wrapped"}
+
+
+def test_records_dumps_functions_stacks_and_snapshots(app, log, monkeypatch):
+    monkeypatch.setattr(bs, "THEME_PACKAGES", set())
+    sampler = bs.StackSampler(log, 0.001, threading.get_ident())
+    sampler.functions = [
+        {"function": "main", "module": "sphinx.cmd.build", "file": "b.py", "line": 1},
+        {
+            "function": "read_doc",
+            "module": "sphinx.builders",
+            "file": "b.py",
+            "line": 2,
+        },
+        {"function": "Path.stat", "module": "pathlib", "file": "p.py", "line": 3},
+        {
+            "function": "render",
+            "module": "layout.html",
+            "file": "layout.html",
+            "line": 1,
+        },
+    ]
+    # stacks are innermost-first: main > read_doc > Path.stat, main > read_doc,
+    # main > render
+    sampler.stacks = [(2, 1, 0), (1, 0), (3, 0)]
+    sampler.snapshots = [(0.0011234567, 0), (0.002, 0), (0.003, 1), (0.004, 2)]
+
+    frames = sampler.records(app)
+
+    assert frames["sampling_interval"] == 0.001
+    assert frames["samples"] == 4
+    assert [f["kind"] for f in frames["functions"]] == [
+        "sphinx-internal",
+        "sphinx-internal",
+        "stdlib",
+        "unknown",
+    ]
+    assert frames["functions"][3]["extension"] == "layout"
+    assert frames["stacks"] == [[2, 1, 0], [1, 0], [3, 0]]
+    # times are rounded to the microsecond
+    assert frames["snapshots"] == [[0.001123, 0], [0.002, 0], [0.003, 1], [0.004, 2]]
+
+
+def test_setup_starts_the_sampler_only_with_the_gil(app, monkeypatch):
+    monkeypatch.setattr(bs, "sampler", None)
+    bs.setup(app)
+    try:
+        assert bs.sampler is not None and bs.sampler.is_alive()
+    finally:
+        bs.sampler.stop()
+
+    monkeypatch.setattr(sys, "_is_gil_enabled", lambda: False, raising=False)
+    bs.setup(app)
+    assert bs.sampler is None
+
+
+def test_build_finished_without_a_sampler_still_writes_the_json(monkeypatch, tmp_path):
+    """With the GIL disabled there is no sampler; the timings must still be written."""
+    monkeypatch.setattr(bs, "sampler", None)
+    monkeypatch.chdir(tmp_path)
+
+    class Builder:
+        name = "html"
+
+    class Config:
+        project, version, copyright = "proj", "1.0", "me"
+
+    app = types.SimpleNamespace(
+        config=Config(), builder=Builder(), confdir=str(tmp_path), extensions={}
+    )
+    recorder.record("source-read", "handler", "some_ext", 0.5, 0.25)
+    bs.build_finished(app, None)
+
+    (json_path,) = tmp_path.glob("sphinx_benchmarks_*.json")
+    data = json.loads(json_path.read_text())
+    assert data["frames"] is None
+    assert data["calls"][0]["handler"] == "handler"

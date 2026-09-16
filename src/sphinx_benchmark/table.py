@@ -12,6 +12,7 @@ from .summary import (
     EmissionDetail,
     GapOccurrence,
     OverviewRow,
+    Profile,
     overview_rows,
 )
 
@@ -278,3 +279,42 @@ def print_gap_occurrences(
         )
     print("-" * width)
     print(f"  {'(total)':32}{'':25}{'':25}{total:15.6f}{s.pct(total):9.2f}%")
+
+
+def print_gap_profile(p: Profile, top: int = 15) -> None:
+    """Print where the time of a gap goes: the ``top`` functions by self time."""
+    header = (
+        f"  {'Function':48}{'Module':38}{'Kind':16}"
+        f"{'Self(s)':>12}{'% gap':>8}{'Total(s)':>12}{'% gap':>8}"
+    )
+    width = len(header)
+    print()
+    print("=" * width)
+    print(
+        f"Inside the gap {p.label}  -  {p.samples} stack samples over "
+        f"{p.seconds:.6f}s (times below are estimated from the samples)"
+    )
+    print("=" * width)
+    print(
+        "  Self = time in the function's own code (calls into the Python standard "
+        "library count towards the caller); Total = the function and everything it "
+        "called."
+    )
+    rows = p.rows[:top]
+    print("-" * width)
+    print(f"  Top {len(rows)} of {len(p.rows)} functions by self time")
+    print("-" * width)
+    print(header)
+    print("-" * width)
+    for r in rows:
+        print(
+            f"  {r.function[:47]:48}{r.module[:37]:38}{r.kind:16}"
+            f"{r.self_seconds:12.6f}{p.pct(r.self_seconds):7.2f}%"
+            f"{r.total_seconds:12.6f}{p.pct(r.total_seconds):7.2f}%"
+        )
+    print("-" * width)
+    if p.tree:
+        print(
+            "  The call tree (which function called which) is drawn as a graph in "
+            "the HTML report: sphinx-benchmark run html"
+        )

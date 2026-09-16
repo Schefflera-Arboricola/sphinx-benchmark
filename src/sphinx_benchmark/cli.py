@@ -9,10 +9,13 @@ import sys
 from .html import write_report
 from .summary import (
     BenchmarkFileError,
+    all_gap_profiles,
+    combined_gap_profile,
     compute_summary,
     emission_details,
     event_names,
     gap_occurrence_details,
+    gap_profile,
     handler_call_details,
     handler_names,
     load_records,
@@ -22,6 +25,7 @@ from .table import (
     print_emissions,
     print_events,
     print_gap_occurrences,
+    print_gap_profile,
     print_gaps,
     print_handler_calls,
     print_overview,
@@ -39,8 +43,10 @@ table selectors:
   table events <event>               every emission of that event
   table events <handler>             every call of that handler (any event)
   table events <event> <handler>     that handler's calls during that event
-  table gaps                         only the gaps summary table
-  table gaps <start-event> <end-event>   every gap between those two events\
+  table gaps                         the gaps summary table, then the functions
+                                     the gap time was sampled in (all gaps)
+  table gaps <start-event> <end-event>   every gap between those two events, then
+                                     the functions that gap's time was sampled in\
 """
 
 
@@ -140,6 +146,9 @@ def _run_table(
             print()
             print("Build time: ", s.total_build_time)
             print_gaps(s)
+            profile = combined_gap_profile(all_gap_profiles(data, s))
+            if profile is not None:
+                print_gap_profile(profile)
             return
         if len(rest) != 2:
             parser.error(
@@ -159,6 +168,9 @@ def _run_table(
                 "run 'sphinx-benchmark run table gaps' to see the pairs that occurred"
             )
         print_gap_occurrences(start, end, rows, s)
+        profile = gap_profile(data, s, start, end)
+        if profile is not None:
+            print_gap_profile(profile)
         return
 
     if view == "events":

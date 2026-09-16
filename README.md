@@ -78,8 +78,8 @@ This is a Sphinx extension that benchmarks and profiles a docs build process [ev
    sphinx-benchmark run table events <event-name>         # every emission of that event, with all details
    sphinx-benchmark run table events <handler-name>       # every call of that handler from any event
    sphinx-benchmark run table events <event-name> <handler-name>    # that handler's calls during that event emission only
-   sphinx-benchmark run table gaps                        # only the gaps summary table
-   sphinx-benchmark run table gaps <start-event> <end-event>  # details of every individual gap between those two events
+   sphinx-benchmark run table gaps                        # the gaps summary table, then function-wise breakdown of where the time of all gaps goes (based on sampling)
+   sphinx-benchmark run table gaps <start-event> <end-event>  # details of every individual gap between those two events, then where that gap's time goes
    ```
 
    You can find the benchmarking outputs for different Scientific Python projects in the 
@@ -94,6 +94,11 @@ This is a Sphinx extension that benchmarks and profiles a docs build process [ev
 
    Then a `sphinx_benchmark_report` folder will be created in your build directory. Open the `index.html` present inside
    `sphinx_benchmark_report` in your browser to see the overview and events, handlers and gaps breakdown.
+   Each event's, handler's and gap's page also shows where the time inside it went (per
+   function) and links to its call tree drawn as a graph (caller at the top, arrows to what it
+   called, each box with its share); hover a box for the file and line where the function is defined.
+   The **Call tree** page draws the whole build, each box coloured by where the build was: inside a
+   handler, inside an event but outside its handlers, or in a gap between events.
    You can also specify the output directory for where you want the `sphinx_benchmark_report` folder to get created, using `--output-dir` option. Or specify a different json file using the `--input` option.
 
 ## How are benchmarks calculated?
@@ -130,6 +135,8 @@ inside that emission, so the emission hasn't ended yet when it's serialised. It'
 with `duration=None` and the summary skips it. Anything after it, like `builder.cleanup()`
 isn't measured at all.
 - The startup blind spot: Timing begins at the extension's `setup()`. The "startup, before first emission" row in the gaps table covers only what happened after that point.
+- The function-wise breakdowns (gaps, events, handlers, whole build) are estimated from samples, not measured: a function seen in only a few samples is noise, so short gaps and handlers/events could be unreliable, and anything that holds the GIL in C code is accounted to the Python function that called it.
+- No sampling (and therefore function-wise breakdown and call-tree) without the GIL: the sampler reads the build thread's frames while holding the GIL, which is only safe because the build thread is paused meanwhile. On a free-threaded Python with the GIL disabled the sampler is not started (the JSON has `"frames": null`, so no call trees); run with `PYTHON_GIL=1` to get these.
 - Some handlers can't be classified: Handlers defined in `conf.py`, or in a package that
 doesn't match anything in `app.extensions`, are classified as `unknown` and reported by
 module or file name. Partials and callable objects have no `__qualname__`, so they're

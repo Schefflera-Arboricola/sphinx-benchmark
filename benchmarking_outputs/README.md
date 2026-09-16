@@ -1,16 +1,19 @@
-This directory contains the benchmarking results for some of the Scientific Python projects' documentation builds.
+This directory contains the benchmarking results for some of the Scientific Python projects' documentation builds. 
+
+unzip the networkx-numpy-benchamrks.zip and then run `sphinx-benchmark run html --input <json file name>` to get the html report for the corresponding docs build.
 
 # Reading the benchmarking output
 
 At fixed points in a docs build process (e.g. after config is read, after a page is parsed, before a page is written, etc.) Sphinx emits an **event**, and every extension or theme that registered a **handler** for
 that event gets called. This tool times each of those events and the handler calls within those events.
 
-Every build with this extension enabled creates a `sphinx_benchmarks_*.json` file with following four things:
+Every build with this extension enabled creates a `sphinx_benchmarks_*.json` file with following five things:
 
 - `project_info` : the project's name, version and copyright from `conf.py`, plus the git `HEAD` commit hash of the docs directory (`None` if it isn't a git repo)
 - `build_info` : the builder name (e.g. `html`), the build's start time (UTC), and `total_wall_time`, the whole build time, start to finish
 - `events` : one record per event emission (when it started, how long it took, how deeply nested it was, etc.)
 - `calls` : one record per handler call (which handler, which event, which extension it came from, how long it took, etc.)
+- `frames` : stack snapshots of the whole build (what was running, and when), from which the call trees per gap, event and handler are built (see Table 3) (`null` if the build wasn't sampled)
 
 The `sphinx-benchmark run table` command uses the data in the above JSON file to print out the two benchamrks summary tables. 
 
@@ -83,3 +86,24 @@ overlapped, that shouldn't happen, so please report an issue for it.
 
 You can further see the break-down of each gap using the 
 `sphinx-benchmark run table gaps <start-event> <end-event>` command.
+
+## Table 3 : what's inside a gap
+
+`sphinx-benchmark run table gaps <start-event> <end-event>` (and `run table gaps` for all
+gaps together) also prints what the build was running during that gap. Throughout the
+build, a background thread takes a snapshot of the build's call stack every few
+milliseconds (it sleeps 1ms between snapshots, but needs the GIL to take one, which the
+build thread hands over at its next I/O call or after Python's 5ms switch interval); the snapshots that fall in the gap are converted to seconds using the gap's measured
+duration, so all of these numbers are estimates.
+
+**Top functions by self time** : **Self** is the time in the function's own code (time
+spent in the Python standard library, like `Path.stat()` or `re`, counts towards the
+function that called it); **Total** is the function plus everything it called. These
+are the same idea as an event's own time and duration.
+
+The HTML report has the same table on every gap's page, plus a link to the gap's
+**call tree** drawn as a graph: the outermost function at the top, an arrow from each
+function to the functions it called, and each box showing how much of the gap was spent
+in it and everything under it. Hover a box for the file and line where the function is
+defined. Branches under 1% of the gap are left out. The Gaps page links to the same
+graph for all gaps together, so reading, resolving and writing can be compared side by side.
