@@ -35,7 +35,9 @@ This is a Sphinx extension that benchmarks and profiles a docs build process [ev
    disable_sampling = True  # False by default
    ```
 
-   To understand what sampling is, read [this](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/benchmarking_outputs/README.md#sampling-call-trees-and-function-wise-breakdown).
+   If your docs build successfully with Python 3.15 then it is recommended to use Tachyon for sampling instead of using sphinx-benchmark's sampling (set `disable_sampling = True`). Read more on this below in the ["Sampling with Python 3.15 (Tachyon)"](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/README.md#sampling-with-python-315-tachyon) section.
+   
+   To understand how sampling is done when `disable_sampling = False` (i.e. the default), read the [benchmarking guide](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/benchmarking_outputs/README.md#sampling-call-trees-and-function-wise-breakdown).
 
 3. Then build your docs as usual:
 
@@ -115,6 +117,55 @@ This is a Sphinx extension that benchmarks and profiles a docs build process [ev
    You can find the benchmarking outputs for different Scientific Python projects in the 
    [benchmarking_outputs](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/benchmarking_outputs/) directory. For more on how to read benchmarking
    output/report and how benchmarks are calculated see [the benchmarking_outputs README](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/benchmarking_outputs/README.md).
+
+
+## Sampling with Python 3.15 (Tachyon)
+
+Sampling with `profiling.sampling` module is recommended over the sphinx-benchmark extension's sampling because:
+
+- sphinx-benchmark's sampling is done via a daemon thread whereas Tachyon's sampling is done externally on the target process, so the overhead is virtually zero!
+- Because Tachyon doesn't use daemon threads for sampling, it can also be run with free-threaded python!
+- Tachyon offers a more diverse set of options to visualise the benchmarking results, as compared to sphinx-benchmark.
+
+Because of all of the above, **we do plan to integrate Tachyon into this extension in the future!**
+
+To build your docs with Python 3.15 `profiling.sampling` module (Tachyon):
+
+- Setup the python 3.15 env
+
+   ```
+   uvx uv@latest python install 3.15
+   uvx uv@latest venv -p 3.15 .venv-315
+   source .venv-315/bin/activate
+   ```
+
+- install requirements in this new environment
+   ```
+   uvx uv@latest pip install sphinx-benchmark
+   uvx uv@latest pip install other_required_packages
+   ...
+   ```
+- set `disable_sampling=True` in `conf.py`
+- Build the docs with `profiling.sampling` module (Tachyon)
+
+   ```
+   sudo -E $VIRTUAL_ENV/bin/python -m profiling.sampling run --binary -o profile.bin -m sphinx -b html -d build/doctrees . build/html
+   ```
+
+- four ways of visualising the build
+
+   ```
+   python -m profiling.sampling replay profile.bin --flamegraph -o flamegraph.html && open flamegraph.html
+
+   python -m profiling.sampling replay profile.bin --heatmap -o heatmap && open heatmap/index.html
+
+   python -m profiling.sampling replay profile.bin --sort=tottime --limit=10
+
+   python -m profiling.sampling replay profile.bin --gecko -o sphinx.gecko.json
+
+   ```
+
+  For the last one, upload the generated gecko file at https://profiler.firefox.com to get the timeline
 
 
 ## Limitations/pain points
