@@ -3,6 +3,7 @@ import os
 
 import pytest
 
+from sphinx_benchmark import html
 from sphinx_benchmark.cli import main
 from sphinx_benchmark.summary import (
     all_gap_profiles,
@@ -26,6 +27,7 @@ SAMPLE = {
         "builder": "html",
         "start_time": "2026-01-01 00:00:00 UTC",
         "total_wall_time": 10.0,
+        "python_version": "3.14.3",
     },
     "calls": [
         {
@@ -286,7 +288,8 @@ def test_run_table_and_html(tmp_path, capsys):
     assert '<span class="project">proj 1.0</span>' in (report / "gaps.html").read_text(
         encoding="utf-8"
     )
-    assert "Sampling interval: <b>1 ms</b>" in index
+    assert "Sampling: <b>default, 1 ms interval</b>" in index
+    assert "Built on Python <b>3.14.3</b>" in index
 
 
 def test_reports_say_sampling_was_off(tmp_path, capsys):
@@ -302,7 +305,117 @@ def test_reports_say_sampling_was_off(tmp_path, capsys):
     assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
     index = (report / "index.html").read_text(encoding="utf-8")
     assert "Sampling: <b>off</b>" in index
-    assert "Sampling interval" not in index
+    assert "ms interval" not in index
+
+
+def test_html_report_shows_tachyon_sampling(tmp_path, monkeypatch):
+    """Tachyon builds show the tachyon_args they used instead of an interval."""
+    monkeypatch.setattr(html.subprocess, "run", lambda *a, **k: FakeRun(0))
+    json_path = tmp_path / "sphinx_benchmarks.json"
+    report = tmp_path / "report"
+    tachyon = {
+        "sampling_method": "tachyon",
+        "tachyon_args": [],
+        "tachyon_binary": "tachyon.bin",
+    }
+    json_path.write_text(json.dumps({**SAMPLE, "frames": tachyon}))
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+    index = (report / "index.html").read_text(encoding="utf-8")
+    assert "Sampling: <b>tachyon</b>, args: <code>[]</code>" in index
+    assert "ms interval" not in index
+
+    args = {"tachyon_args": ["-r", "10khz"]}
+    json_path.write_text(json.dumps({**SAMPLE, "frames": {**tachyon, **args}}))
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+    index = (report / "index.html").read_text(encoding="utf-8")
+    assert (
+        "Sampling: <b>tachyon</b>, args: <code>[&#x27;-r&#x27;, &#x27;10khz&#x27;]</code>"
+        in index
+    )
+
+
+class FakeRun:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+def test_tachyon_pages_redirect_to_tachyons_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(html.sys, "version_info", (3, 15, 0))
+    replays = []
+    monkeypatch.setattr(
+        html.subprocess, "run", lambda cmd, **k: replays.append(cmd) or FakeRun(0)
+    )
+    json_path = tmp_path / "sphinx_benchmarks.json"
+    frames = {"sampling_method": "tachyon", "tachyon_binary": "/b/tachyon.bin"}
+    json_path.write_text(json.dumps({**SAMPLE, "frames": frames}))
+    report = tmp_path / "report"
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+
+    assert [cmd[3:] for cmd in replays] == [
+        [
+            "replay",
+            "--flamegraph",
+            "-o",
+            str(report / "flamegraph.html"),
+            "/b/tachyon.bin",
+        ],
+        ["replay", "--heatmap", "-o", str(report / "heatmap"), "/b/tachyon.bin"],
+    ]
+    page = (report / "tachyon_flamegraph.html").read_text(encoding="utf-8")
+    assert 'content="0; url=flamegraph.html"' in page
+    page = (report / "tachyon_heatmap.html").read_text(encoding="utf-8")
+    assert 'content="0; url=heatmap/index.html"' in page
+
+    # replay failed
+    monkeypatch.setattr(html.subprocess, "run", lambda *a, **k: FakeRun(1))
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+    page = (report / "tachyon_heatmap.html").read_text(encoding="utf-8")
+    assert "Tachyon could not make the heatmap" in page
+    assert "This build was on Python 3.14.3" in page
+
+    # the report is made on Python < 3.15, so replay isn't run
+    monkeypatch.setattr(html.sys, "version_info", (3, 14, 0))
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+    page = (report / "tachyon_heatmap.html").read_text(encoding="utf-8")
+    assert "Please make the report with Python 3.15 or later" in page
+
+
+def test_tachyon_pages_without_tachyon_sampling(tmp_path):
+    json_path = tmp_path / "sphinx_benchmarks.json"
+    json_path.write_text(json.dumps(SAMPLE))
+    report = tmp_path / "report"
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+
+    index = (report / "index.html").read_text(encoding="utf-8")
+    assert '<a href="tachyon_flamegraph.html">Flamegraph</a>' in index
+    assert '<a href="tachyon_heatmap.html">Heatmap</a>' in index
+    for page in ("tachyon_flamegraph.html", "tachyon_heatmap.html"):
+        text = (report / page).read_text(encoding="utf-8")
+        assert "Please try switching to Python 3.15 or later" in text
+        assert "This build was on Python 3.14.3" in text
+
+
+def test_tachyon_pages_when_tachyon_could_not_attach(tmp_path):
+    """A 3.15 build that fell back to the default sampling says why."""
+    json_path = tmp_path / "sphinx_benchmarks.json"
+    build_info = {**SAMPLE["build_info"], "python_version": "3.15.0rc2"}
+    json_path.write_text(json.dumps({**SAMPLE, "build_info": build_info}))
+    report = tmp_path / "report"
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+    text = (report / "tachyon_heatmap.html").read_text(encoding="utf-8")
+    assert "Tachyon could not attach to the build" in text
+    assert "switching to Python 3.15" not in text
+
+
+def test_tachyon_pages_when_sampling_was_off(tmp_path):
+    json_path = tmp_path / "sphinx_benchmarks.json"
+    build_info = {**SAMPLE["build_info"], "python_version": "3.15.0"}
+    data = {**SAMPLE, "build_info": build_info, "frames": None}
+    json_path.write_text(json.dumps(data))
+    report = tmp_path / "report"
+    assert main(["run", "html", "-i", str(json_path), "-o", str(report)]) == 0
+    text = (report / "tachyon_flamegraph.html").read_text(encoding="utf-8")
+    assert "The build was not sampled, so there is no flamegraph" in text
 
 
 def test_run_default_overview(tmp_path, capsys):
@@ -574,7 +687,7 @@ def test_table_and_html_show_gap_profiles(tmp_path, capsys):
     assert "sampled while the docs" not in gap_page
     # ... with the sampling interval, and why samples can be further apart than it
     for page in (tree_page, functions_page):
-        assert "sampling interval: 1 ms" in page
+        assert "sampling: default, 1 ms interval" in page
         assert "more than 1 ms apart" in page
     # one box per function on the tree, with where it is defined on hover
     assert tree_page.count('class="node"') == 5  # main, read_doc, parse, parse, stat

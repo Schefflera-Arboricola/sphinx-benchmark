@@ -337,6 +337,16 @@ class BuildSummary:
     sampling_interval : float or None
         The stack sampler's interval in seconds (``frames.sampling_interval``
         in the JSON); None if the build recorded no frames.
+    sampling_method : str or None
+        How the build was sampled (``frames.sampling_method`` in the JSON,
+        ``"default"`` for the extension's stack sampler); None if the build
+        recorded no frames.
+    tachyon_args : tuple of str
+        The ``tachyon_args`` Tachyon sampled the build with
+        (``frames.tachyon_args`` in the JSON); empty for Tachyon's defaults.
+    tachyon_binary : str or None
+        Path of the binary profile Tachyon wrote (``frames.tachyon_binary``
+        in the JSON); None if the build was not sampled with Tachyon.
     """
 
     time_in_events: float
@@ -348,6 +358,9 @@ class BuildSummary:
     project_info: dict = field(default_factory=dict)
     build_info: dict = field(default_factory=dict)
     sampling_interval: float | None = None
+    sampling_method: str | None = None
+    tachyon_args: tuple[str, ...] = ()
+    tachyon_binary: str | None = None
 
     @property
     def total_build_time(self) -> float:
@@ -405,7 +418,10 @@ def compute_summary(data: dict) -> BuildSummary:
     time_in_events = sum(own_totals.values())
     project_info = data.get("project_info") or {}
     build_info = data.get("build_info") or {}
-    sampling_interval = (data.get("frames") or {}).get("sampling_interval")
+    frames = data.get("frames") or {}
+    sampling_interval = frames.get("sampling_interval")
+    # JSONs written before sampling_method existed were all sampled by the default sampler
+    sampling_method = frames.get("sampling_method", "default") if frames else None
     total_build_time = build_info.get("total_wall_time") or time_in_events or 1.0
 
     by_event: dict[str, list[HandlerRow]] = defaultdict(list)
@@ -477,6 +493,9 @@ def compute_summary(data: dict) -> BuildSummary:
         project_info=project_info,
         build_info=build_info,
         sampling_interval=sampling_interval,
+        sampling_method=sampling_method,
+        tachyon_args=tuple(frames.get("tachyon_args", ())),
+        tachyon_binary=frames.get("tachyon_binary"),
     )
 
 
