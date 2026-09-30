@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import signal
 import subprocess
 import sys
 import threading
@@ -435,6 +437,7 @@ class StackSampler(threading.Thread):
             kind, extension = classify_module(f["module"], app)
             functions.append({**f, "kind": kind, "extension": extension})
         return {
+            "sampling_method": "default",
             "sampling_interval": self.interval,
             "samples": len(self.snapshots),
             "functions": functions,
@@ -443,8 +446,59 @@ class StackSampler(threading.Thread):
         }
 
 
+class TachyonSampler:
+    """Samples the docs build with Python 3.15's ``profiling.sampling``
+    (Tachyon), run in a subprocess attached to this process.
+
+    Parameters
+    ----------
+    args : list of str
+        Extra arguments for ``profiling.sampling attach`` (the
+        ``tachyon_args`` config value), passed as they are.
+    output : str
+        Path of the binary profile Tachyon writes.
+    """
+
+    def __init__(self, args: list[str], output: str) -> None:
+        self.args = list(args)
+        self.output = os.path.abspath(output)
+        self.process: subprocess.Popen | None = None
+
+    def start(self) -> bool:
+        """Start Tachyon; return False if it can't read this process's
+        memory (e.g. without sudo on macOS)."""
+        tachyon = [sys.executable, "-m", "profiling.sampling"]
+        pid = str(os.getpid())
+        # dump reads this process's stack once, so it fails the same way attach would
+        dump = [*tachyon, "dump", pid]
+        if subprocess.run(dump, stdout=subprocess.DEVNULL, check=False).returncode:
+            return False
+        self.process = subprocess.Popen(
+            [*tachyon, "attach", "--binary", "-o", self.output, *self.args, pid]
+        )
+        return True
+
+    def stop(self) -> None:
+        """Stop sampling; Tachyon writes the binary profile on SIGINT."""
+        self.process.send_signal(signal.SIGINT)
+        self.process.wait()
+
+    def records(self, app: Sphinx) -> dict:
+        """The ``"frames"`` value of the JSON."""
+        return {
+            "sampling_method": "tachyon",
+            "tachyon_args": self.args,
+            "tachyon_binary": self.output,
+        }
+
+
+_README_TACHYON = (
+    "https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/"
+    "README.md#sampling-with-python-315-tachyon"
+)
+
 recorder = Recorder()
-sampler: StackSampler | None = None
+sampler: StackSampler | TachyonSampler | None = None
 
 # set as an attribute on every wrapped handler to avoid wrapping an already wrapped handler
 _WRAP_FLAG = "_event_profiler_wrapped"
@@ -639,6 +693,7 @@ def build_finished(app: Sphinx, exception) -> None:
             "builder": app.builder.name,
             "start_time": recorder.start_ts.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "total_wall_time": recorder.total_wall_time,
+            "python_version": platform.python_version(),
         }
         try:
             out = subprocess.run(
@@ -683,26 +738,48 @@ def setup(app: Sphinx):
             types=frozenset({float, int}),
         )
         app.add_config_value("disable_sampling", False, "", types=frozenset({bool}))
+        app.add_config_value("tachyon_args", [], "", types=frozenset({list}))
         recorder.start()
         wrap_emit(app)
         wrap_all_listeners(app)
         wrap_connect(app)
 
-        if app.config.disable_sampling:
-            sampler = None
-        elif getattr(sys, "_is_gil_enabled", lambda: True)():
-            sampler = StackSampler(
-                recorder,
-                app.config.sphinx_benchmark_sampling_interval,
-                threading.get_ident(),
-            )
-            sampler.start()
-        else:
-            sampler = None
-            logger.warning(
-                "the GIL is disabled, so the build is not sampled (no call trees); "
-                "run with PYTHON_GIL=1 to enable sampling"
-            )
+        sampler = None
+        if not app.config.disable_sampling:
+            # Tachyon is stopped with SIGINT, which Windows can't send to a process
+            if sys.version_info >= (3, 15) and sys.platform != "win32":
+                stamp = recorder.start_ts.strftime("%Y%m%d-%H%M%S")
+                sampler = TachyonSampler(
+                    app.config.tachyon_args, f"tachyon_{stamp}.bin"
+                )
+                if not sampler.start():
+                    sampler = None
+                    logger.warning(
+                        "\n%s\nTACHYON COULD NOT SAMPLE THE BUILD (see its error above),"
+                        "\nfalling back to the default sampling: no flamegraph or"
+                        "\nheatmap. See the README for the permissions Tachyon needs:"
+                        "\n%s\n%s",
+                        "=" * 70,
+                        _README_TACHYON,
+                        "=" * 70,
+                    )
+            if sampler is None and getattr(sys, "_is_gil_enabled", lambda: True)():
+                sampler = StackSampler(
+                    recorder,
+                    app.config.sphinx_benchmark_sampling_interval,
+                    threading.get_ident(),
+                )
+                sampler.start()
+            elif sampler is None:
+                logger.warning(
+                    "the GIL is disabled, so the build is not sampled (no call trees); "
+                    "run with PYTHON_GIL=1 to enable sampling"
+                )
+
+        method = "tachyon" if isinstance(sampler, TachyonSampler) else "default"
+        logger.info(
+            "sphinx-benchmark sampling: %s", method if sampler else "off", color="green"
+        )
 
         # the priority is set to 999  so that if any other handlers are connected
         # with the build-finished event, then those get executed first and stored in the json.

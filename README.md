@@ -35,8 +35,8 @@ This is a Sphinx extension that benchmarks and profiles a docs build process [ev
    disable_sampling = True  # False by default
    ```
 
-   If your docs build successfully with Python 3.15 then it is recommended to use Tachyon for sampling instead of using sphinx-benchmark's sampling (set `disable_sampling = True`). Read more on this below in the ["Sampling with Python 3.15 (Tachyon)"](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/README.md#sampling-with-python-315-tachyon) section.
-   
+   On Python >= 3.15 (except on Windows), sphinx-benchmark samples the build with Tachyon (Python's `profiling.sampling` module) instead of its own sampler, and the HTML report also gets a flamegraph and a heatmap. Read more on this below in the ["Sampling with Python 3.15 (Tachyon)"](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/README.md#sampling-with-python-315-tachyon) section.
+
    To understand how sampling is done when `disable_sampling = False` (i.e. the default), read the [benchmarking guide](https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/benchmarking_outputs/README.md#sampling-call-trees-and-function-wise-breakdown).
 
 3. Then build your docs as usual:
@@ -121,48 +121,53 @@ This is a Sphinx extension that benchmarks and profiles a docs build process [ev
 
 ## Sampling with Python 3.15 (Tachyon)
 
-Sampling with `profiling.sampling` module is recommended over the sphinx-benchmark extension's sampling because:
+On Python >= 3.15 (except on Windows), sphinx-benchmark samples the docs build with the `profiling.sampling` module (Tachyon) instead of its own sampler. Tachyon support isn't on PyPI yet, so install sphinx-benchmark from `main` (see [Usage](#usage)) to use it. Tachyon is better because:
 
 - sphinx-benchmark's sampling is done via a daemon thread whereas Tachyon's sampling is done externally on the target process, so the overhead is virtually zero!
 - Because Tachyon doesn't use daemon threads for sampling, it can also be run with free-threaded python!
 - Tachyon offers a more diverse set of options to visualise the benchmarking results, as compared to sphinx-benchmark.
 
-Because of all of the above, **we do plan to integrate Tachyon into this extension in the future!**
+To build your docs with Tachyon:
 
-To build your docs with Python 3.15 `profiling.sampling` module (Tachyon):
+- Optionally, pass extra arguments to `profiling.sampling attach` with
 
-- Setup the python 3.15 env
-
-   ```
-   uvx uv@latest python install 3.15
-   uvx uv@latest venv -p 3.15 .venv-315
-   source .venv-315/bin/activate
+   ```python
+   tachyon_args = ["--all-threads"]
    ```
 
-- install requirements in this new environment
-   ```
-   uvx uv@latest pip install sphinx-benchmark
-   uvx uv@latest pip install other_required_packages
-   ...
-   ```
-- set `disable_sampling=True` in `conf.py`
-- Build the docs with `profiling.sampling` module (Tachyon)
+- Build the docs. Tachyon reads the build process's memory from outside it, which needs extra permissions, and these differ by OS:
+
+   - **macOS**: build with `sudo`. `sudo` resets `PATH`, so give the full path of the venv's python:
+
+      ```
+      sudo -E $VIRTUAL_ENV/bin/python -m sphinx build -b html docs/ docs/_build/html
+      ```
+
+   - **Linux (e.g. Ubuntu)**: Tachyon needs the `CAP_SYS_PTRACE` capability. Either build with `sudo` as on macOS, or (on Ubuntu and other distros with Yama's `ptrace_scope` set to 1 by default) allow tracing without `sudo` until the next reboot, and then build as usual:
+
+      ```
+      echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+      python -m sphinx build -b html docs/ docs/_build/html
+      ```
+
+      Inside a Docker container, start the container with `--cap-add=SYS_PTRACE` (or `--privileged`).
+
+   - **Windows**: not supported yet. sphinx-benchmark stops Tachyon with `SIGINT`, which Windows can't send to another process, so on Windows the build is always sampled with sphinx-benchmark's own sampler.
+
+   Near the start of the build log, `sphinx-benchmark sampling: tachyon` says Tachyon is sampling the build. If Tachyon can't attach (e.g. without `sudo` on macOS), a big `TACHYON COULD NOT SAMPLE THE BUILD` warning is shown and the build falls back to sphinx-benchmark's sampling (so no flamegraph or heatmap).
+
+   On macOS and Linux, files made by a `sudo` build are owned by root; take them back with
 
    ```
-   sudo -E $VIRTUAL_ENV/bin/python -m profiling.sampling run --binary -o profile.bin -m sphinx -b html -d build/doctrees . build/html
+   sudo chown -R $USER docs/_build sphinx_benchmarks_*.json tachyon_*.bin
    ```
 
-- four ways of visualising the build
+- `sphinx-benchmark run html` then adds the "Flamegraph" and "Heatmap" pages to the report. The build also leaves Tachyon's binary profile, `tachyon_<date>-<build's start time>.bin`, in the present working directory, which can be visualised in more ways:
 
    ```
-   python -m profiling.sampling replay profile.bin --flamegraph -o flamegraph.html && open flamegraph.html
+   python -m profiling.sampling replay tachyon_<date>-<build's start time>.bin --sort=tottime --limit=10
 
-   python -m profiling.sampling replay profile.bin --heatmap -o heatmap && open heatmap/index.html
-
-   python -m profiling.sampling replay profile.bin --sort=tottime --limit=10
-
-   python -m profiling.sampling replay profile.bin --gecko -o sphinx.gecko.json
-
+   python -m profiling.sampling replay tachyon_<date>-<build's start time>.bin --gecko -o sphinx.gecko.json
    ```
 
   For the last one, upload the generated gecko file at https://profiler.firefox.com to get the timeline

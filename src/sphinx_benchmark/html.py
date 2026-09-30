@@ -34,6 +34,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
+import sys
 from html import escape
 from urllib.parse import quote
 
@@ -103,12 +105,25 @@ PALETTE = [
     "#a25a4f",
 ]
 
+#: Tachyon's views of the build, made with ``profiling.sampling replay``:
+#: (nav page, title, replay flag, replay output, page the nav page redirects to)
+_TACHYON_VIEWS = [
+    (
+        "tachyon_flamegraph.html",
+        "Flamegraph",
+        "--flamegraph",
+        "flamegraph.html",
+        "flamegraph.html",
+    ),
+    ("tachyon_heatmap.html", "Heatmap", "--heatmap", "heatmap", "heatmap/index.html"),
+]
+
 _PAGES = [
     ("index.html", "Overview"),
     ("events.html", "Events &amp; handlers"),
     ("gaps.html", "Gaps"),
     ("build.html", "Whole build"),
-]
+] + [(page, title) for page, title, *_ in _TACHYON_VIEWS]
 
 
 # ------------------------------------------------------------------- links --
@@ -323,17 +338,27 @@ def _overview_body(s: BuildSummary, links: _Links) -> str:
     p, b = s.project_info, s.build_info
     info = ""
     if p or b:
-        sampling = (
-            "Sampling: <b>off</b>"
-            if s.sampling_interval is None
-            else f"Sampling interval: <b>{s.sampling_interval * 1000:g} ms</b>"
+        if s.sampling_method is None:
+            sampling = "Sampling: <b>off</b>"
+        elif s.sampling_method == "tachyon":
+            args = escape(repr(list(s.tachyon_args)))
+            sampling = f"Sampling: <b>tachyon</b>, args: <code>{args}</code>"
+        else:
+            sampling = (
+                f"Sampling: <b>{escape(str(s.sampling_method))}, "
+                f"{s.sampling_interval * 1000:g} ms interval</b>"
+            )
+        python = (
+            f" · Built on Python <b>{escape(b['python_version'])}</b>"
+            if b.get("python_version")
+            else ""
         )
         info = f"""
 <p class="meta">Project: <b>{escape(str(p.get("name", "-")))} {escape(str(p.get("version", "")))}</b>
  · HEAD: <code>{escape(str(p.get("HEAD") or "-"))}</code>
  · Builder: <b>{escape(str(b.get("builder", "-")))}</b>
  · Started: {escape(str(b.get("start_time", "-")))}
- · {sampling}</p>"""
+ · {sampling}{python}</p>"""
     body = f"""
 <div class="banner"><b>WARNING:</b> sphinx-benchmark is not parallel-read or
 parallel-write safe, so it forces a serial build. These numbers do not
@@ -664,7 +689,7 @@ def _profile_section(p: Profile, interval: float, min_total_pct: float = 0.5) ->
     }[p.scope]
     return f"""
 <p class="meta">{p.samples} stack samples of the build thread
-(sampling interval: {interval * 1000:g} ms) were taken {covers}
+(sampling: default, {interval * 1000:g} ms interval) were taken {covers}
 ({p.seconds:.6f}s), so the times below are estimates.</p>
 <p class="meta">Note: two samples can be more than {interval * 1000:g} ms apart.
 To record a sample the sampler thread needs Python's GIL, which can take up
@@ -812,7 +837,7 @@ def _tree_page_body(
     )
     return f"""
 <p class="meta">{p.seconds:.6f}s ({s.pct(p.seconds):.2f}% of the build), estimated
-from {p.samples} stack samples (sampling interval: {interval * 1000:g} ms). Every node shows how much of the {escape(p.scope)}
+from {p.samples} stack samples (sampling: default, {interval * 1000:g} ms interval). Every node shows how much of the {escape(p.scope)}
 was spent in it. Branches under 1% of the {escape(p.scope)} are left out. {coloured}.
 <b>Hover a box</b> for where the function is defined (file:line) and its self time.</p>
 <p class="meta">Note: two samples can be more than {interval * 1000:g} ms apart.
@@ -831,6 +856,17 @@ _NO_BUILD_TREE = """
 <h1>Call tree: (whole build)</h1>
 <p class="meta">The build was not sampled,
 so there is no call tree.</p>"""
+
+_README_TACHYON = (
+    "https://github.com/Schefflera-Arboricola/sphinx-benchmark/blob/main/"
+    "README.md#sampling-with-python-315-tachyon"
+)
+
+_REDIRECT = """<!DOCTYPE html>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url={target}">
+<p><a href="{target}">{target}</a></p>
+"""
 
 
 # ------------------------------------------------------------------- write --
@@ -906,6 +942,43 @@ def write_report(s: BuildSummary, out_dir: str, data: dict, json_path: str = "")
         write(
             "build.html", _page("Call tree", "build.html", _NO_BUILD_TREE, s, json_path)
         )
+    for page, title, flag, output, target in _TACHYON_VIEWS:
+        python = s.build_info.get("python_version")
+        built_on = f" This build was on Python {escape(python)}." if python else ""
+        on_315 = python and tuple(map(int, python.split(".")[:2])) >= (3, 15)
+        if s.sampling_method is None:
+            body = f"""
+<h1>{title}</h1>
+<p class="meta">The build was not sampled, so there is no {title.lower()}.{built_on}</p>"""
+        elif s.sampling_method != "tachyon" and on_315:
+            body = f"""
+<h1>{title}</h1>
+<p class="meta">Tachyon could not attach to the build, so it fell back to the
+default sampling. Tachyon needs extra permissions to read the build's memory; see
+<a href="{_README_TACHYON}">the README</a> for how to give them on your OS.{built_on}</p>"""
+        elif s.sampling_method != "tachyon":
+            body = f"""
+<h1>{title}</h1>
+<p class="meta">These can only be generated with
+<a href="https://docs.python.org/3.15/library/profiling.sampling.html">Tachyon</a>
+on Python &gt;= 3.15. Please try switching to Python 3.15 or later to get these.{built_on}</p>"""
+        elif sys.version_info < (3, 15):
+            body = f"""
+<h1>{title}</h1>
+<p class="meta">The build was sampled with Tachyon, but making the
+{title.lower()} from <code>{escape(s.tachyon_binary or "")}</code> needs Python
+&gt;= 3.15. Please make the report with Python 3.15 or later.{built_on}</p>"""
+        else:
+            replay = [sys.executable, "-m", "profiling.sampling", "replay", flag]
+            replay += ["-o", os.path.join(out_dir, output), s.tachyon_binary or ""]
+            if subprocess.run(replay, check=False).returncode == 0:
+                write(page, _REDIRECT.format(target=target))
+                continue
+            body = f"""
+<h1>{title}</h1>
+<p class="meta">Tachyon could not make the {title.lower()} from
+<code>{escape(s.tachyon_binary or "")}</code>; see its error in the terminal.{built_on}</p>"""
+        write(page, _page(title, page, body, s, json_path))
     write("style.css", _STYLE)
     write("report.js", _REPORT_JS)
     # group the raw records once; each detail page then renders its own rows

@@ -1,4 +1,5 @@
 import json
+import platform
 import re
 import sys
 import threading
@@ -304,6 +305,7 @@ def test_real_build_benchmarks(tmp_path, monkeypatch):
     assert data["build_info"]["total_wall_time"] > 0
     assert data["build_info"]["builder"] == "html"
     assert data["build_info"]["start_time"]
+    assert data["build_info"]["python_version"] == platform.python_version()
     assert data["project_info"]["name"] == "proj"
     assert "HEAD" in data["project_info"]
     assert data["calls"] and data["events"]
@@ -313,6 +315,7 @@ def test_real_build_benchmarks(tmp_path, monkeypatch):
     assert all(c["kind"] != "unknown" or c["extension"] for c in data["calls"])
     assert any(c["kind"] == "sphinx-internal" for c in data["calls"])
     frames = data["frames"]
+    assert frames["sampling_method"] == "default"
     assert frames["sampling_interval"] == bs.DEFAULT_SAMPLING_INTERVAL
     assert frames["samples"] == len(frames["snapshots"]) > 0
     assert {f["kind"] for f in frames["functions"]} >= {"sphinx-internal", "stdlib"}
@@ -462,6 +465,45 @@ def test_disable_sampling_from_conf(app, monkeypatch):
     app.config.disable_sampling = True
     bs.setup(app)
     assert bs.sampler is None
+
+
+def test_setup_samples_with_tachyon_on_python_315(app, monkeypatch):
+    monkeypatch.setattr(bs, "sampler", None)
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(bs.TachyonSampler, "start", lambda self: True)
+    app.config.tachyon_args = ["-r", "10khz"]
+    bs.setup(app)
+    assert isinstance(bs.sampler, bs.TachyonSampler)
+    assert bs.sampler.records(app) == {
+        "sampling_method": "tachyon",
+        "tachyon_args": ["-r", "10khz"],
+        "tachyon_binary": bs.sampler.output,
+    }
+
+
+def test_setup_falls_back_to_default_sampling_if_tachyon_fails(app, monkeypatch):
+    monkeypatch.setattr(bs, "sampler", None)
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(bs.TachyonSampler, "start", lambda self: False)
+    bs.setup(app)
+    try:
+        assert isinstance(bs.sampler, bs.StackSampler)
+    finally:
+        bs.sampler.stop()
+
+
+def test_setup_does_not_use_tachyon_on_windows(app, monkeypatch):
+    monkeypatch.setattr(bs, "sampler", None)
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0))
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(bs.TachyonSampler, "start", lambda self: True)
+    bs.setup(app)
+    try:
+        assert isinstance(bs.sampler, bs.StackSampler)
+    finally:
+        bs.sampler.stop()
 
 
 def test_build_finished_without_a_sampler_still_writes_the_json(monkeypatch, tmp_path):
